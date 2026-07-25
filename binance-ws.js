@@ -1,152 +1,163 @@
 // ============================================================
-// binance-ws.js — real-time data via Binance Futures combined
-// WebSocket streams. Falls back to REST polling automatically
-// if the socket can't stay connected.
+// binance-ws.js — one combined WebSocket for price + funding +
+// liquidations across the whole exchange, filtered down to
+// `state.trackedSymbols` at the parsing layer (Binance pushes
+// ~400+ symbols/sec on !ticker@arr and !markPrice@arr@1s whether
+// we want them or not — filtering here means updates for symbols
+// we don't display never touch state, the bus, or the DOM at all).
+//
+// A second, separate WS subscribes to aggTrade for whichever
+// symbol is currently selected in the chart, to drive the CVD
+// panel — opened/closed on demand so we're never paying for trade
+// tick volume on 150 symbols simultaneously.
 // ============================================================
-import { backoffMs } from './utils.js';
-import { upsertTicker, upsertMarketData, pushLiquidation, setStatus } from './state.js';
-import { pollTickersOnce, pollFundingOnce } from './binance-rest.js';
+import { state, setConnStatus, upsertTicker, upsertMarketData, pushLiquidation, addCvdDelta } from './state.js';
+import { sleep } from './utils.js';
+import { startRestFallbackPolling, stopRestFallbackPolling } from './binance-rest.js';
 
-const FSTREAM = 'wss://fstream.binance.com/stream?streams=';
-// !ticker@arr        -> 24h rolling ticker for every futures symbol, ~1s
-// !markPrice@arr@1s   -> mark price + current funding rate for every symbol, 1s
-// !forceOrder@arr     -> every liquidation order across the whole exchange
-const STREAMS = ['!ticker@arr', '!markPrice@arr@1s', '!forceOrder@arr'].join('/');
+const WS_BASE = 'wss://fstream.binance.com/stream?streams=';
+const COMBINED_STREAMS = ['!ticker@arr', '!markPrice@arr@1s', '!forceOrder@arr'];
 
-let ws = null;
-let reconnectAttempt = 0;
-let fallbackTimer = null;
-let intentionalClose = false;
+let mainSocket = null;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let fallbackActive = false;
 
-// Binance's !ticker@arr / !markPrice@arr@1s streams push EVERY perpetual
-// on the exchange (~400+ symbols) once a second, but the UI only ever
-// shows ~150 (the matrix universe) + the 3 hero symbols. Without a filter,
-// every tick does ~250 wasted Map writes + bus emits + DOM lookups that
-// nothing is listening for. `trackedSymbols` starts as null (process
-// everything) so hero-card data isn't lost during the brief window before
-// the symbol universe is known, then narrows once setTrackedSymbols runs.
-let trackedSymbols = null;
+let cvdSocket = null;
+let cvdSymbol = null;
 
-export function setTrackedSymbols(symbols) {
-  trackedSymbols = new Set(symbols);
-}
+export function startMainSocket() {
+  const url = WS_BASE + COMBINED_STREAMS.join('/');
+  mainSocket = new WebSocket(url);
 
-function isTracked(sym) {
-  return trackedSymbols === null || trackedSymbols.has(sym);
-}
-
-export function startBinanceFeed() {
-  intentionalClose = false;
-  connect();
-}
-
-export function stopBinanceFeed() {
-  intentionalClose = true;
-  clearTimeout(fallbackTimer);
-  ws?.close();
-}
-
-function connect() {
-  try {
-    ws = new WebSocket(FSTREAM + STREAMS);
-  } catch (e) {
-    console.error('WS construct failed', e);
-    scheduleReconnect();
-    return;
-  }
-
-  ws.onopen = () => {
-    reconnectAttempt = 0;
-    setStatus('tickerWs', 'live');
-    setStatus('liqWs', 'live');
-    clearTimeout(fallbackTimer);
+  mainSocket.onopen = () => {
+    reconnectAttempts = 0;
+    if (fallbackActive) {
+      fallbackActive = false;
+      stopRestFallbackPolling();
+    }
+    setConnStatus('live');
   };
 
-  ws.onmessage = (msg) => {
-    let payload;
-    try { payload = JSON.parse(msg.data); } catch { return; }
-    const { stream, data } = payload;
+  mainSocket.onmessage = (evt) => {
+    let msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch {
+      return;
+    }
+    const stream = msg.stream;
+    const data = msg.data;
     if (!stream || !data) return;
 
-    if (stream === '!ticker@arr') handleTickerArr(data);
-    else if (stream === '!markPrice@arr@1s') handleMarkPriceArr(data);
-    else if (stream === '!forceOrder@arr') handleLiquidation(data);
+    if (stream.startsWith('!ticker@arr')) handleTickerArray(data);
+    else if (stream.startsWith('!markPrice@arr')) handleMarkPriceArray(data);
+    else if (stream.startsWith('!forceOrder@arr')) handleForceOrder(data);
   };
 
-  ws.onerror = () => {
-    // onclose fires right after — reconnect logic lives there
-  };
-
-  ws.onclose = () => {
-    if (intentionalClose) return;
-    setStatus('tickerWs', 'error');
-    setStatus('liqWs', 'error');
+  mainSocket.onclose = () => {
     scheduleReconnect();
+  };
+
+  mainSocket.onerror = () => {
+    mainSocket?.close();
   };
 }
 
 function scheduleReconnect() {
-  reconnectAttempt += 1;
-  // after a few failed attempts, keep the UI alive with REST polling
-  // while we keep retrying the socket in the background
-  if (reconnectAttempt >= 3) {
-    setStatus('tickerWs', 'fallback');
-    armRestFallback();
+  reconnectAttempts += 1;
+  if (reconnectAttempts >= 3 && !fallbackActive) {
+    fallbackActive = true;
+    setConnStatus('fallback');
+    startRestFallbackPolling();
+  } else if (reconnectAttempts < 3) {
+    setConnStatus('connecting');
   }
-  const wait = backoffMs(reconnectAttempt);
-  setTimeout(connect, wait);
+  const delay = Math.min(1000 * 2 ** Math.min(reconnectAttempts, 5), 30000);
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(startMainSocket, delay);
 }
 
-function armRestFallback() {
-  clearTimeout(fallbackTimer);
-  const tick = async () => {
-    try {
-      await pollTickersOnce();
-      await pollFundingOnce();
-    } catch (e) {
-      console.error('REST fallback poll failed', e);
-    }
-    fallbackTimer = setTimeout(tick, 5000);
-  };
-  tick();
-}
-
-function handleTickerArr(arr) {
-  for (const t of arr) {
-    if (!t.s.endsWith('USDT') || !isTracked(t.s)) continue;
-    upsertTicker(t.s, {
+function handleTickerArray(rows) {
+  for (const t of rows) {
+    const symbol = t.s;
+    if (!state.trackedSymbols.has(symbol)) continue;
+    upsertTicker(symbol, {
       price: parseFloat(t.c),
       chg24: parseFloat(t.P),
-      vol24: parseFloat(t.q),   // quote volume (USDT)
-      high24: parseFloat(t.h),
-      low24: parseFloat(t.l),
+      vol24: parseFloat(t.v),
+      quoteVol24: parseFloat(t.q),
     });
   }
 }
 
-function handleMarkPriceArr(arr) {
-  for (const m of arr) {
-    if (!m.s.endsWith('USDT') || !isTracked(m.s)) continue;
-    upsertMarketData(m.s, {
+function handleMarkPriceArray(rows) {
+  for (const m of rows) {
+    const symbol = m.s;
+    if (!state.trackedSymbols.has(symbol)) continue;
+    upsertMarketData(symbol, {
       markPrice: parseFloat(m.p),
-      funding: parseFloat(m.r),
+      funding: parseFloat(m.r) * 100, // as %
       nextFundingTime: m.T,
     });
   }
 }
 
-function handleLiquidation(d) {
-  const o = d.o;
+function handleForceOrder(evt) {
+  const o = evt.o;
   if (!o) return;
+  const symbol = o.s;
+  if (!state.trackedSymbols.has(symbol)) return;
   const qty = parseFloat(o.q);
-  const price = parseFloat(o.ap || o.p);
+  const price = parseFloat(o.ap) || parseFloat(o.p);
   const usd = qty * price;
+  // SELL force order = a long position got liquidated; BUY = a short got liquidated.
+  const side = o.S === 'SELL' ? 'long' : 'short';
   pushLiquidation({
-    sym: o.s,
-    side: o.S,           // SELL liquidation = a long got liquidated, BUY = a short got liquidated
-    price,
-    qty,
+    symbol,
+    side,
     usd,
-    time: o.T,
+    price,
+    time: o.T || Date.now(),
   });
+}
+
+// ---------- CVD: per-symbol aggTrade stream, swapped on selection ----------
+
+export function subscribeCvd(symbol) {
+  if (symbol === cvdSymbol) return;
+  cvdSocket?.close();
+  cvdSymbol = symbol;
+  const url = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@aggTrade`;
+  cvdSocket = new WebSocket(url);
+  cvdSocket.onmessage = (evt) => {
+    let t;
+    try {
+      t = JSON.parse(evt.data);
+    } catch {
+      return;
+    }
+    const qty = parseFloat(t.q);
+    const price = parseFloat(t.p);
+    const usd = qty * price;
+    // m === true means the buyer is the market maker -> aggressive SELL.
+    const delta = t.m ? -usd : usd;
+    addCvdDelta(symbol, delta);
+  };
+  cvdSocket.onclose = () => {
+    if (cvdSymbol === symbol) {
+      // symbol still selected but socket dropped — retry shortly
+      setTimeout(() => {
+        if (cvdSymbol === symbol) subscribeCvd(symbol);
+      }, 2000);
+    }
+  };
+}
+
+export async function restartMainSocketHard() {
+  mainSocket?.close();
+  clearTimeout(reconnectTimer);
+  reconnectAttempts = 0;
+  await sleep(300);
+  startMainSocket();
 }

@@ -1,6 +1,6 @@
 // ============================================================
-// external-api.js — non-Binance data sources.
-//   - CoinGecko: market cap + fallback price/volume if Binance is down
+// external-api.js — everything that isn't Binance:
+//   - CoinGecko: market cap for the overview panels
 //   - alternative.me: Crypto Fear & Greed Index
 //
 // Note on CoinGlass: their public API requires a paid key and is
@@ -13,6 +13,8 @@
 // merge the result into state.marketData the same way the Binance
 // REST helpers do.
 // ============================================================
+import { setFearGreed, upsertMarketData, state } from './state.js';
+import { sleep } from './utils.js';
 
 const CG = 'https://api.coingecko.com/api/v3';
 
@@ -22,23 +24,48 @@ async function getJson(url) {
   return res.json();
 }
 
-/** symbol (e.g. "BTC") -> market cap USD, for the top N coins by market cap */
-export async function getMarketCaps(vsCurrency = 'usd', perPage = 200) {
-  const rows = await getJson(
-    `${CG}/coins/markets?vs_currency=${vsCurrency}&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`
-  );
-  const map = {};
-  for (const r of rows) map[r.symbol.toUpperCase()] = r.market_cap;
-  return map;
+export async function loadMarketCaps(vsCurrency = 'usd', perPage = 200) {
+  try {
+    const rows = await getJson(
+      `${CG}/coins/markets?vs_currency=${vsCurrency}&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`
+    );
+    for (const r of rows) {
+      const symbol = `${r.symbol.toUpperCase()}USDT`;
+      if (state.trackedSymbols.has(symbol)) upsertMarketData(symbol, { mcap: r.market_cap });
+    }
+  } catch {
+    // market cap is decorative — a failed fetch shouldn't break anything else
+  }
 }
 
-export async function getFearGreedIndex() {
-  const d = await getJson('https://api.alternative.me/fng/?limit=1');
-  const row = d?.data?.[0];
-  if (!row) return null;
-  return {
-    value: parseInt(row.value, 10),
-    label: row.value_classification,
-    updatedAt: parseInt(row.timestamp, 10) * 1000,
+export async function loadFearGreed() {
+  try {
+    const d = await getJson('https://api.alternative.me/fng/?limit=1');
+    const row = d?.data?.[0];
+    if (!row) return;
+    setFearGreed({
+      value: parseInt(row.value, 10),
+      label: row.value_classification,
+      updatedAt: parseInt(row.timestamp, 10) * 1000,
+    });
+  } catch {
+    // leave previous value in place
+  }
+}
+
+/** Fear & Greed only moves once a day; alternative.me suggests polling infrequently. */
+export function startFearGreedLoop() {
+  const tick = async () => {
+    if (!document.hidden) await loadFearGreed();
   };
+  tick();
+  setInterval(tick, 5 * 60 * 1000);
+}
+
+export function startMarketCapLoop() {
+  const tick = async () => {
+    if (!document.hidden) await loadMarketCaps();
+  };
+  tick();
+  setInterval(tick, 5 * 60 * 1000);
 }

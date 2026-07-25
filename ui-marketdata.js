@@ -1,70 +1,54 @@
 // ============================================================
-// ui-marketdata.js — funding rate, open interest, long/short
-// ratio panel for the currently selected symbol. Funding/mark
-// price stream live from the WS; OI% and L/S ratio are polled
-// (Binance has no push stream for either) on a light interval.
+// ui-marketdata.js — funding / mark price / OI / L-S ratio panel
+// for whichever symbol is currently selected in the chart/table.
 // ============================================================
-import { bus, state } from './state.js';
-import { fNum, fPct, clsForVal } from './utils.js';
-import { getOpenInterest, getOpenInterestChangePct, getLongShortRatio } from './binance-rest.js';
+import { bus } from './utils.js';
+import { state } from './state.js';
+import { fmtPrice, fmtCompact, fmtPct, pctClass, flash } from './utils.js';
 
-let pollTimer = null;
+const el = {};
 
-export function initMarketDataPanel() {
-  render();
-  bus.on('marketData', ({ sym }) => { if (sym === state.selectedSymbol) render(); });
-  bus.on('ticker', ({ sym }) => { if (sym === state.selectedSymbol) render(); });
-  bus.on('selectedSymbol', () => { render(); refreshPolled(); });
+export function initMarketData() {
+  el.funding = document.getElementById('md-funding');
+  el.fundingNext = document.getElementById('md-funding-next');
+  el.mark = document.getElementById('md-mark');
+  el.oi = document.getElementById('md-oi');
+  el.oiUsd = document.getElementById('md-oi-usd');
+  el.oiPct = document.getElementById('md-oi-pct');
+  el.lsRatio = document.getElementById('md-ls-ratio');
+  el.lsLongBar = document.getElementById('md-ls-long');
+  el.lsLongLbl = document.getElementById('md-ls-long-lbl');
+  el.lsShortLbl = document.getElementById('md-ls-short-lbl');
 
-  refreshPolled();
-  pollTimer = setInterval(refreshPolled, 30000);
+  bus.on('marketdata:selected', render);
+
+  const current = state.marketData.get(state.selectedSymbol);
+  if (current) render(current);
 }
 
-async function refreshPolled() {
-  const sym = state.selectedSymbol;
-  try {
-    const [oi, oiPct, ls] = await Promise.all([
-      getOpenInterest(sym),
-      getOpenInterestChangePct(sym, '1h'),
-      getLongShortRatio(sym),
-    ]);
-    if (sym !== state.selectedSymbol) return; // user switched away mid-flight
-    const price = state.tickers.get(sym)?.price;
-    document.getElementById('md-oi').textContent = oi != null ? `${fNum(oi, 0)} contracts` : '–';
-    document.getElementById('md-oi-usd').textContent = price ? `≈ $${fNum(oi * price, 0)}` : '';
-    const oiPctEl = document.getElementById('md-oi-pct');
-    oiPctEl.textContent = oiPct != null ? fPct(oiPct) + ' (1h)' : '–';
-    oiPctEl.className = `md-sub ${clsForVal(oiPct)}`;
-
-    if (ls) {
-      const longPct = (ls.ratio / (1 + ls.ratio)) * 100;
-      document.getElementById('md-ls-ratio').textContent = ls.ratio.toFixed(2);
-      document.getElementById('md-ls-long').style.width = `${longPct.toFixed(1)}%`;
-      document.getElementById('md-ls-long-lbl').textContent = `L ${longPct.toFixed(1)}%`;
-      document.getElementById('md-ls-short-lbl').textContent = `S ${(100 - longPct).toFixed(1)}%`;
-    }
-  } catch (e) {
-    console.error('marketdata poll failed', e);
+function render(d) {
+  if (d.funding != null) {
+    el.funding.textContent = fmtPct(d.funding);
+    el.funding.className = 'md-big ' + pctClass(d.funding);
+    flash(el.funding, d.funding >= 0 ? 'up' : 'down');
   }
-}
-
-function render() {
-  const sym = state.selectedSymbol;
-  const md = state.marketData.get(sym) || {};
-  document.getElementById('md-symbol').textContent = sym;
-
-  const fEl = document.getElementById('md-funding');
-  if (md.funding != null) {
-    fEl.textContent = fPct(md.funding * 100, 4);
-    fEl.className = `md-big ${clsForVal(md.funding)}`;
-  } else {
-    fEl.textContent = '–';
+  if (d.nextFundingTime) {
+    const mins = Math.max(0, Math.round((d.nextFundingTime - Date.now()) / 60000));
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    el.fundingNext.textContent = `Kỳ tiếp theo: ${h}h ${m}m`;
   }
-
-  const next = md.nextFundingTime ? new Date(md.nextFundingTime) : null;
-  document.getElementById('md-funding-next').textContent = next
-    ? `Kỳ tiếp theo: ${next.toLocaleTimeString('vi-VN')}`
-    : '';
-
-  document.getElementById('md-mark').textContent = md.markPrice != null ? `$${fNum(md.markPrice, 2)}` : '–';
+  if (d.markPrice != null) el.mark.textContent = fmtPrice(d.markPrice);
+  if (d.oi != null) el.oi.textContent = fmtCompact(d.oi, '');
+  if (d.oiUsd != null) el.oiUsd.textContent = '≈ ' + fmtCompact(d.oiUsd);
+  if (d.oiPct1h != null) {
+    el.oiPct.textContent = fmtPct(d.oiPct1h) + ' (1h)';
+    el.oiPct.className = 'md-sub ' + pctClass(d.oiPct1h);
+  }
+  if (d.lsRatio != null) el.lsRatio.textContent = d.lsRatio.toFixed(2);
+  if (d.lsLongPct != null && d.lsShortPct != null) {
+    el.lsLongBar.style.width = `${d.lsLongPct}%`;
+    el.lsLongLbl.textContent = `L ${d.lsLongPct.toFixed(1)}%`;
+    el.lsShortLbl.textContent = `S ${d.lsShortPct.toFixed(1)}%`;
+  }
 }

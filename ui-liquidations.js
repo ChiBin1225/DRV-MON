@@ -1,48 +1,39 @@
 // ============================================================
-// ui-liquidations.js — live liquidation feed, driven purely off
-// the Binance !forceOrder@arr websocket stream (state.liquidations).
-// Large liquidations (>= LARGE_USD) get a highlighted row + pulse.
+// ui-liquidations.js — live liquidation feed + rolling 30-min
+// totals. Prepends new rows via a single DOM insert per event
+// (no full-list re-render), caps the visible list, and gives
+// large liquidations a highlight class.
 // ============================================================
-import { bus, state } from './state.js';
-import { fNum } from './utils.js';
+import { bus } from './utils.js';
+import { fmtCompact, fmtPrice } from './utils.js';
 
-const LARGE_USD = 250_000;
-const HUGE_USD = 1_000_000;
-const MAX_ROWS = 60;
+const MAX_VISIBLE_ROWS = 40;
+const BIG_LIQ_USD = 100000;
 
-export function initLiquidationsPanel() {
+export function initLiquidations() {
   const list = document.getElementById('liq-list');
-  list.innerHTML = '';
+  const totalEl = document.getElementById('liq-total-30m');
+  const longEl = document.getElementById('liq-long-30m');
+  const shortEl = document.getElementById('liq-short-30m');
 
-  bus.on('liquidation', (evt) => {
+  bus.on('liq:new', (liq) => {
     const row = document.createElement('div');
-    row.className = `liq-row ${evt.usd >= HUGE_USD ? 'liq-huge' : evt.usd >= LARGE_USD ? 'liq-large' : ''}`;
-    // side "SELL" liquidation order = an over-leveraged LONG got force-closed
-    const isLongLiq = evt.side === 'SELL';
+    row.className = 'liq-row ' + (liq.side === 'long' ? 'liq-long' : 'liq-short') + (liq.usd >= BIG_LIQ_USD ? ' liq-big' : '');
     row.innerHTML = `
-      <span class="liq-side ${isLongLiq ? 'c-neg' : 'c-pos'}">${isLongLiq ? 'LONG LIQ' : 'SHORT LIQ'}</span>
-      <span class="liq-sym">${evt.sym.replace('USDT', '')}</span>
-      <span class="liq-usd">$${fNum(evt.usd, 0)}</span>
-      <span class="liq-time">${new Date(evt.time).toLocaleTimeString('vi-VN')}</span>
+      <span class="liq-sym">${liq.symbol.replace('USDT', '')}</span>
+      <span class="liq-side">${liq.side === 'long' ? 'LONG' : 'SHORT'}</span>
+      <span class="liq-usd">${fmtCompact(liq.usd)}</span>
+      <span class="liq-price c-dim">${fmtPrice(liq.price)}</span>
     `;
     list.prepend(row);
-    while (list.children.length > MAX_ROWS) list.lastChild.remove();
-
-    updateTotals();
+    while (list.children.length > MAX_VISIBLE_ROWS) {
+      list.removeChild(list.lastChild);
+    }
   });
 
-  updateTotals();
-  setInterval(updateTotals, 5000);
-}
-
-function updateTotals() {
-  const cutoff = Date.now() - 30 * 60 * 1000;
-  const recent = state.liquidations.filter((e) => e.time >= cutoff);
-  const longUsd = recent.filter((e) => e.side === 'SELL').reduce((s, e) => s + e.usd, 0);
-  const shortUsd = recent.filter((e) => e.side === 'BUY').reduce((s, e) => s + e.usd, 0);
-  document.getElementById('liq-total-30m').textContent = `$${fNum(longUsd + shortUsd, 0)}`;
-  document.getElementById('liq-long-30m').textContent = `$${fNum(longUsd, 0)}`;
-  document.getElementById('liq-short-30m').textContent = `$${fNum(shortUsd, 0)}`;
-  const statEl = document.getElementById('stat-liq30');
-  if (statEl) statEl.textContent = `$${fNum(longUsd + shortUsd, 0)}`;
+  bus.on('liq:totals', (totals) => {
+    totalEl.textContent = fmtCompact(totals.total);
+    longEl.textContent = fmtCompact(totals.long);
+    shortEl.textContent = fmtCompact(totals.short);
+  });
 }

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DRV MON — Real-Time Crypto Trading Dashboard</title>
-<meta name="description" content="DRV MON — real-time crypto futures terminal: giá, funding, open interest, long/short ratio, thanh lý trực tiếp từ Binance.">
+<meta name="description" content="DRV MON — real-time crypto futures terminal: giá, funding, open interest, long/short ratio, CVD, thanh lý trực tiếp từ Binance.">
 <meta name="theme-color" content="#050709">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23050709'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' font-weight='700' fill='%23e8b400' text-anchor='middle'%3ED%3C/text%3E%3C/svg%3E">
 
@@ -68,54 +68,68 @@
     <div id="tv-chart"></div>
   </div>
 
-  <div class="panel md-panel">
-    <div class="panel-head"><span class="title">Market Data · <span id="md-symbol">BTCUSDT</span></span></div>
-    <div class="md-body">
-      <div>
-        <div class="md-label">Funding Rate</div>
-        <div class="md-big" id="md-funding">–</div>
-        <div class="md-sub c-dim" id="md-funding-next"></div>
-      </div>
-      <div class="md-grid2">
-        <div>
-          <div class="md-label">Mark Price</div>
-          <div class="md-mid" id="md-mark">–</div>
-        </div>
-        <div>
-          <div class="md-label">Open Interest</div>
-          <div class="md-mid" id="md-oi">–</div>
-        </div>
-      </div>
-      <div class="md-grid2">
-        <div>
-          <div class="md-label">OI (USD)</div>
-          <div class="md-mid c-dim" id="md-oi-usd">–</div>
-          <div class="md-sub" id="md-oi-pct"></div>
-        </div>
-        <div>
-          <div class="md-label">L/S Ratio</div>
-          <div class="md-mid" id="md-ls-ratio">–</div>
-        </div>
-      </div>
-      <div>
-        <div class="md-label">Long / Short Accounts</div>
-        <div class="ls-bar"><div class="ls-bar-long" id="md-ls-long" style="width:50%"></div></div>
-        <div class="ls-lbls">
-          <span class="c-pos" id="md-ls-long-lbl">L –</span>
-          <span class="c-neg" id="md-ls-short-lbl">S –</span>
-        </div>
-      </div>
-    </div>
-  </div>
+  <div class="side-col">
 
-  <div class="panel liq-panel">
-    <div class="panel-head"><span class="title">Liquidations · Live</span></div>
-    <div class="liq-totals">
-      <div>30M TOTAL<b id="liq-total-30m">$0</b></div>
-      <div class="c-pos">LONGS<b id="liq-long-30m">$0</b></div>
-      <div class="c-neg">SHORTS<b id="liq-short-30m">$0</b></div>
+    <div class="panel md-panel">
+      <div class="panel-head"><span class="title">Market Data · <span id="md-symbol">BTCUSDT</span></span></div>
+      <div class="md-body">
+        <div>
+          <div class="md-label">Funding Rate</div>
+          <div class="md-big" id="md-funding">–</div>
+          <div class="md-sub c-dim" id="md-funding-next"></div>
+        </div>
+        <div class="md-grid2">
+          <div>
+            <div class="md-label">Mark Price</div>
+            <div class="md-mid" id="md-mark">–</div>
+          </div>
+          <div>
+            <div class="md-label">Open Interest</div>
+            <div class="md-mid" id="md-oi">–</div>
+          </div>
+        </div>
+        <div class="md-grid2">
+          <div>
+            <div class="md-label">OI (USD)</div>
+            <div class="md-mid c-dim" id="md-oi-usd">–</div>
+            <div class="md-sub" id="md-oi-pct"></div>
+          </div>
+          <div>
+            <div class="md-label">L/S Ratio</div>
+            <div class="md-mid" id="md-ls-ratio">–</div>
+          </div>
+        </div>
+        <div>
+          <div class="md-label">Long / Short Accounts</div>
+          <div class="ls-bar"><div class="ls-bar-long" id="md-ls-long" style="width:50%"></div></div>
+          <div class="ls-lbls">
+            <span class="c-pos" id="md-ls-long-lbl">L –</span>
+            <span class="c-neg" id="md-ls-short-lbl">S –</span>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="liq-list" id="liq-list"></div>
+
+    <div class="panel cvd-panel">
+      <div class="panel-head"><span class="title">CVD (Futures) · <span id="cvd-symbol">BTCUSDT</span></span></div>
+      <div class="cvd-body">
+        <div class="md-label">Cumulative Volume Delta · phiên hiện tại</div>
+        <div class="md-big" id="cvd-value">–</div>
+        <div class="cvd-spark" id="cvd-spark"></div>
+        <div class="md-sub c-dim">Tổng hợp từ aggTrade real-time (mua chủ động − bán chủ động)</div>
+      </div>
+    </div>
+
+    <div class="panel liq-panel">
+      <div class="panel-head"><span class="title">Liquidations · Live</span></div>
+      <div class="liq-totals">
+        <div>30M TOTAL<b id="liq-total-30m">$0</b></div>
+        <div class="c-pos">LONGS<b id="liq-long-30m">$0</b></div>
+        <div class="c-neg">SHORTS<b id="liq-short-30m">$0</b></div>
+      </div>
+      <div class="liq-list" id="liq-list"></div>
+    </div>
+
   </div>
 
 </section>
@@ -171,7 +185,7 @@
 </section>
 
 <footer class="note">
-  Nguồn dữ liệu: Binance Futures WebSocket (giá, funding, thanh lý real-time) · Binance REST (open interest, long/short ratio) ·
+  Nguồn dữ liệu: Binance Futures WebSocket (giá, funding, thanh lý, CVD real-time) · Binance REST (open interest, long/short ratio) ·
   CoinGecko (vốn hóa) · Alternative.me (Fear &amp; Greed). Không phải lời khuyên đầu tư.
 </footer>
 

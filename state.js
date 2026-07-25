@@ -1,66 +1,90 @@
 // ============================================================
-// state.js — single in-memory store. Modules mutate through the
-// exported setters and subscribe via `bus` instead of reaching
-// into each other's internals.
+// state.js — single source of truth. UI modules subscribe to
+// bus events; API modules write here and emit. Nobody reaches
+// into another module's DOM directly.
 // ============================================================
-import { EventBus } from './utils.js';
-
-export const bus = new EventBus();
+import { bus } from './utils.js';
 
 export const state = {
-  // symbol -> { sym, price, prevPrice, chg24, vol24, quoteVol24, high24, low24, updatedAt }
-  tickers: new Map(),
-
-  // symbol -> { funding, nextFundingTime, oi, oiUsd, lsRatio, updatedAt }
-  marketData: new Map(),
-
-  // rolling buffer of recent liquidation events, newest first
-  liquidations: [],
-
-  // currently selected symbol for chart + market-data panel
+  connStatus: 'connecting', // connecting | live | fallback
+  universe: [],             // ["BTCUSDT", "ETHUSDT", ...] sorted by 24h volume desc
+  trackedSymbols: new Set(),// same set, for O(1) WS filtering
+  tickers: new Map(),       // symbol -> { price, prevPrice, chg24, vol24, quoteVol24 }
+  marketData: new Map(),    // symbol -> { funding, nextFundingTime, markPrice, oi, oiUsd, oiPct1h, lsRatio, lsLongPct, lsShortPct, mcap }
+  liquidations: [],         // recent forceOrder events, newest first, capped
+  liqTotals: { total: 0, long: 0, short: 0 }, // rolling 30-min USD totals
+  fearGreed: null,          // { value, label }
   selectedSymbol: 'BTCUSDT',
-
-  // fear & greed index snapshot
-  fearGreed: null,
-
-  // connection status flags, surfaced in the header
-  status: {
-    tickerWs: 'connecting',   // connecting | live | fallback | error
-    liqWs: 'connecting',
-  },
+  cvd: new Map(),           // symbol -> running cumulative volume delta (session)
 };
 
-export function upsertTicker(sym, patch) {
-  const prev = state.tickers.get(sym);
-  const next = { ...prev, sym, ...patch, updatedAt: Date.now() };
-  state.tickers.set(sym, next);
-  bus.emit('ticker', { sym, prev, next });
+export function setConnStatus(status) {
+  state.connStatus = status;
+  bus.emit('conn:status', status);
 }
 
-export function upsertMarketData(sym, patch) {
-  const prev = state.marketData.get(sym) || {};
-  const next = { ...prev, ...patch, updatedAt: Date.now() };
-  state.marketData.set(sym, next);
-  bus.emit('marketData', { sym, next });
+export function setUniverse(symbols) {
+  state.universe = symbols;
+  state.trackedSymbols = new Set(symbols);
+  bus.emit('universe:ready', symbols);
 }
 
-export function pushLiquidation(evt) {
-  state.liquidations.unshift(evt);
-  if (state.liquidations.length > 150) state.liquidations.length = 150;
-  bus.emit('liquidation', evt);
+export function upsertTicker(symbol, patch) {
+  const prev = state.tickers.get(symbol) || {};
+  const next = { ...prev, prevPrice: prev.price, ...patch };
+  state.tickers.set(symbol, next);
+  bus.emit('ticker:update', { symbol, data: next });
 }
 
-export function setStatus(key, val) {
-  state.status[key] = val;
-  bus.emit('status', { key, val });
+export function upsertMarketData(symbol, patch) {
+  const prev = state.marketData.get(symbol) || {};
+  const next = { ...prev, ...patch };
+  state.marketData.set(symbol, next);
+  bus.emit('marketdata:update', { symbol, data: next });
+  if (symbol === state.selectedSymbol) bus.emit('marketdata:selected', next);
 }
 
-export function setSelectedSymbol(sym) {
-  state.selectedSymbol = sym;
-  bus.emit('selectedSymbol', sym);
+export function pushLiquidation(liq) {
+  state.liquidations.unshift(liq);
+  if (state.liquidations.length > 80) state.liquidations.length = 80;
+
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  state.liquidations = state.liquidations.filter((l) => l.time >= cutoff);
+  const totals = state.liquidations.reduce(
+    (acc, l) => {
+      acc.total += l.usd;
+      acc[l.side === 'long' ? 'long' : 'short'] += l.usd;
+      return acc;
+    },
+    { total: 0, long: 0, short: 0 }
+  );
+  state.liqTotals = totals;
+  bus.emit('liq:new', liq);
+  bus.emit('liq:totals', totals);
 }
 
 export function setFearGreed(fg) {
   state.fearGreed = fg;
-  bus.emit('fearGreed', fg);
+  bus.emit('feargreed:update', fg);
+}
+
+export function setSelectedSymbol(symbol) {
+  if (symbol === state.selectedSymbol) return;
+  state.selectedSymbol = symbol;
+  bus.emit('symbol:selected', symbol);
+  const md = state.marketData.get(symbol);
+  if (md) bus.emit('marketdata:selected', md);
+}
+
+export function addCvdDelta(symbol, deltaUsd) {
+  const prev = state.cvd.get(symbol) || 0;
+  const next = prev + deltaUsd;
+  state.cvd.set(symbol, next);
+  if (symbol === state.selectedSymbol) bus.emit('cvd:update', next);
+  return next;
+}
+
+export function resetCvd(symbol) {
+  state.cvd.set(symbol, 0);
+  if (symbol === state.selectedSymbol) bus.emit('cvd:update', 0);
 }
