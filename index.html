@@ -288,6 +288,7 @@ let hiddenCols = new Set();
 let mcapCache = {};
 let topNSymbols = [];        // symbols currently getting depth polling + CVD streams
 let topNSet = new Set();
+let spotSymbols = new Set();  // "XXXUSDT" names listed on spot
 let autoSort = true;
 let alertsOn = false;
 let watchlist = new Set(JSON.parse(localStorage.getItem('drvmon_watch')||'[]'));
@@ -469,10 +470,17 @@ function flashRow(tr, dir) {
 // BOOTSTRAP — one parallel REST batch, then WS takes over
 // ============================================================
 async function bootstrap() {
-  const [tickers, funding] = await Promise.all([
+  const [tickers, funding, spotList] = await Promise.all([
     fetchJSON(`${BASE}/fapi/v1/ticker/24hr`),
     fetchJSON(`${BASE}/fapi/v1/premiumIndex`),
+    fetchJSON(`${SBASE}/api/v3/ticker/price`).catch(()=>[]),
   ]);
+  // Symbols that exist on Binance SPOT. Tokenized stocks/commodities
+  // (XAU, SNDK, SOXL, CL…) are futures-only: no spot price → no CB
+  // premium, no CVD Spot. Previously they sat on "loading…" forever and,
+  // because spot+fut klines were fetched with one Promise.all, the spot
+  // 400 also wiped out the futures CVD.
+  spotSymbols = new Set((Array.isArray(spotList)?spotList:[]).map(x=>x.symbol));
 
   const fundMap = {};
   funding.forEach(d=>{
@@ -486,6 +494,7 @@ async function bootstrap() {
     const sym = d.symbol.replace('USDT','');
     const row = {
       sym,
+      hasSpot: spotSymbols.size ? spotSymbols.has(d.symbol) : true,
       price: parseFloat(d.lastPrice),
       chg24: parseFloat(d.priceChangePercent),
       vol24: parseFloat(d.quoteVolume),
@@ -515,7 +524,10 @@ async function bootstrap() {
   applyFilters();
 
   fetchMarketCaps(allCoinsData.slice(0,200).map(d=>d.sym));
-  seedCvdWindows(topNSymbols);
+  // seed first, THEN start depth polling — running both at once was a
+  // ~30 req/s burst right after the 24hr-ticker call, enough for a 429
+  // that blocked every REST field for 2 minutes.
+  seedCvdWindows(topNSymbols).then(startDepthPollLoop);
 }
 
 // ============================================================
@@ -526,11 +538,12 @@ let spotSocket = null;
 let futReconnectAttempts = 0;
 let spotReconnectAttempts = 0;
 
-function setConnPill(status) {
+function setConnPill(status, extra) {
   const pill = document.getElementById('connPill');
   if (!pill) return;
   if (status === 'live') { pill.textContent = '● LIVE'; pill.className = 'conn-pill live'; }
   else if (status === 'fallback') { pill.textContent = '● REST FALLBACK'; pill.className = 'conn-pill fallback'; }
+  else if (status === 'ratelimit') { pill.textContent = `● RATE LIMITED ${Math.ceil((extra||0)/1000)}s`; pill.className = 'conn-pill fallback'; }
   else { pill.textContent = '● CONNECTING'; pill.className = 'conn-pill warn'; }
 }
 
@@ -559,7 +572,7 @@ function startFuturesSocket() {
 }
 
 function startSpotSocket() {
-  const klineStreams = topNSymbols.map(s => `${s.toLowerCase()}usdt@kline_1m`);
+  const klineStreams = topNSymbols.filter(s => bySym.get(s)?.hasSpot).map(s => `${s.toLowerCase()}usdt@kline_1m`);
   const streams = ['!miniTicker@arr', ...klineStreams];
   spotSocket = new WebSocket(SPOT_WS_BASE + streams.join('/'));
 
@@ -698,15 +711,14 @@ async function seedCvdWindows(symbols) {
     await Promise.all(batch.map(async sym => {
       const row = bySym.get(sym);
       if (!row) return;
-      try {
-        const [spotK, futK] = await Promise.all([
-          fetchJSON(`${SBASE}/api/v3/klines?symbol=${sym}USDT&interval=1m&limit=${CVD_WINDOW}`),
-          fetchJSON(`${BASE}/fapi/v1/klines?symbol=${sym}USDT&interval=1m&limit=${CVD_WINDOW}`),
-        ]);
-        row.cvdSpot = cumulativeFromKlines(spotK);
-        row.cvdFut  = cumulativeFromKlines(futK);
-        markDirty(sym);
-      } catch { /* leave empty, live stream will populate it going forward */ }
+      // fetched independently: a missing spot market must not kill the futures CVD
+      const [spotK, futK] = await Promise.all([
+        row.hasSpot ? fetchJSON(`${SBASE}/api/v3/klines?symbol=${sym}USDT&interval=1m&limit=${CVD_WINDOW}`).catch(()=>null) : Promise.resolve(null),
+        fetchJSON(`${BASE}/fapi/v1/klines?symbol=${sym}USDT&interval=1m&limit=${CVD_WINDOW}`).catch(()=>null),
+      ]);
+      if (spotK) row.cvdSpot = cumulativeFromKlines(spotK);
+      if (futK)  row.cvdFut  = cumulativeFromKlines(futK);
+      markDirty(sym);
     }));
     await sleep(400);
   }
@@ -731,14 +743,20 @@ let depthLoopStop = false;
 async function startDepthPollLoop() {
   depthLoopStop = false;
   const BATCH = 2;
+  const fapiHost = new URL(BASE).host;
   while (!depthLoopStop) {
     if (document.hidden) { await sleep(3000); continue; }
     for (let i=0;i<topNSymbols.length;i+=BATCH) {
       if (depthLoopStop) return;
       if (document.hidden) break;
+      // If Binance told us to back off, wait it out here instead of
+      // firing 5×40 doomed requests and then sleeping 45s on top.
+      const wait = (rateLimitUntil[fapiHost]||0) - Date.now();
+      if (wait > 0) { setConnPill('ratelimit', wait); await sleep(Math.min(wait, 5000)); i -= BATCH; continue; }
+      if (futuresSocket?.readyState === 1) setConnPill('live');
       const batch = topNSymbols.slice(i, i+BATCH);
       await Promise.all(batch.map(fetchDepthForSymbol));
-      await sleep(800);
+      await sleep(1000);
     }
     await sleep(45000); // full pass roughly every 45s+ (was 5 min polling everything before)
   }
@@ -794,6 +812,11 @@ async function fetchMarketCaps(symbols) {
     Object.entries(CMC_SLUGS).forEach(([sym, slug]) => { reverseSlug[slug] = sym; });
     data.forEach(coin => {
       const sym = reverseSlug[coin.id] || coin.symbol.toUpperCase();
+      const row = bySym.get(sym);
+      const mapped = !!reverseSlug[coin.id];
+      // unmapped id → CoinGecko may return a different token with the same ticker;
+      // a real coin's mcap is never a tiny fraction of its own 24h perp volume
+      if (!mapped && row && coin.market_cap < row.vol24 * 0.02) return;
       if (coin.market_cap) { mcapCache[sym] = coin.market_cap; markDirty(sym); }
     });
   } catch(e) { console.warn('CoinGecko mcap fetch failed', e); }
@@ -1028,7 +1051,7 @@ function buildTable(data) {
       <td data-col="cvdfut" class="cell-cvdfut"><span class="c-dim">loading…</span></td>
       <td data-col="lsratio" class="cell-lsratio"><span class="c-dim">–</span></td>
       <td data-col="liqd" class="cell-liqd"><span class="c-dim">–</span></td>
-      <td data-col="cbprem" class="cell-cbprem"><span class="cb-val c-dim">–</span><span style="display:block;font-size:9px;color:var(--dim)">Spot vs Perp</span></td>
+      <td data-col="cbprem" class="cell-cbprem"><span class="cb-val c-dim">${d.hasSpot?'–':'no spot'}</span><span style="display:block;font-size:9px;color:var(--dim)">${d.hasSpot?'Spot vs Perp':'futures only'}</span></td>
       <td data-col="signal" class="cell-signal"><div class="sig-wrap"></div></td>
       <td data-col="score" class="cell-score" style="text-align:center;min-width:64px"><span class="c-dim">–</span></td>
     `;
@@ -1129,7 +1152,7 @@ function renderComplexCells(sym) {
     const img = d.cvdSpot.length ? drawSparkline(d.cvdSpot, '#60d0ff', 100, 30) : null;
     refs.cvdspot.innerHTML = img
       ? `<div class="spark-wrap"><img src="${img}" width="100" height="30"><span class="spark-val" style="color:#60d0ff">${fNum(spotLast,0)}</span></div>`
-      : `<span class="c-dim">${topNSet.has(d.sym)?'loading…':'–'}</span>`;
+      : `<span class="c-dim">${!d.hasSpot?'no spot':topNSet.has(d.sym)?'loading…':'–'}</span>`;
   }
   if (fk !== d._sparkFutKey) {
     d._sparkFutKey = fk;
@@ -1415,7 +1438,6 @@ async function start() {
   }
   startFuturesSocket();
   startSpotSocket();
-  startDepthPollLoop();
   startMarketCapLoop();
   setInterval(throttledRenderSweep, 1200);
   // funding countdown ticks even when a symbol has no ticker traffic
